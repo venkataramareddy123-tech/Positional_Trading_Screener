@@ -1,0 +1,10 @@
+nselib
+pandas
+numpy
+xgboost
+streamlit
+pyarrow
+fastparquet
+ta
+scikit-learn
+yfinance
