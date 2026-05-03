@@ -1,7 +1,6 @@
 # 🏦 Institutional Volume Screener & ML Platform
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An advanced Machine Learning platform designed to reverse-engineer institutional "Smart Money" footprints in the Indian Stock Market (NSE). This tool bypasses the "noise" of retail trading to find where big players are accumulating shares.
 
