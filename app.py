@@ -56,6 +56,15 @@ DATA_DIR = "data"
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed_data.parquet")
 MODEL_FILE = os.path.join(DATA_DIR, "xgb_model.pkl")
 METRICS_FILE = os.path.join(DATA_DIR, "ml_metrics.json")
+LABEL_DIAGNOSTICS_FILE = os.path.join(DATA_DIR, "label_diagnostics.json")
+BASE_MODEL_FEATURES = [
+    'Vol_Surge', 'Del_Surge', 'Close_Location',
+    'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
+    'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
+    'Smart_Money_Score'
+]
+VIX_MODEL_FEATURES = ['India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D']
+MODEL_FEATURES = BASE_MODEL_FEATURES + VIX_MODEL_FEATURES
 
 @st.cache_data
 def load_data():
@@ -82,6 +91,20 @@ def safe_predict_proba(model, X):
         return (model.predict_proba(X)[:, 1] * 100).round(2)
     except ValueError:
         return np.zeros(len(X))
+
+def get_model_features(metrics, model):
+    if metrics and metrics.get('features'):
+        return metrics['features']
+    expected_features = getattr(model, 'n_features_in_', None)
+    if expected_features == len(MODEL_FEATURES):
+        return MODEL_FEATURES
+    return BASE_MODEL_FEATURES
+
+def load_label_diagnostics():
+    if os.path.exists(LABEL_DIAGNOSTICS_FILE):
+        with open(LABEL_DIAGNOSTICS_FILE, 'r') as f:
+            return json.load(f)
+    return None
 
 def run_pipeline_ui():
     progress_bar = st.progress(0)
@@ -134,6 +157,9 @@ if df is None:
                 st.error(f"Error running pipeline: {str(e)}")
     st.stop()
 
+model_features = get_model_features(metrics, model)
+if any(feature not in df.columns for feature in model_features):
+    model_features = BASE_MODEL_FEATURES
 latest_date = df['Date'].max()
 nifty_latest = df[df['Date'] == latest_date][['Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200', 'India_VIX']].iloc[0]
 
@@ -185,13 +211,6 @@ with tab1:
         
     st.markdown(f"*(Showing alerts from **{start_dt_t1.strftime('%b %d, %Y')}** to **{latest_date.strftime('%b %d, %Y')}**)*")
     
-    features = [
-        'Vol_Surge', 'Del_Surge', 'Close_Location',
-        'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
-        'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
-        'Smart_Money_Score'
-    ]
-    
     latest_prices = df[df['Date'] == latest_date].set_index('Symbol')['Close']
     
     col_l1, col_l2 = st.columns(2)
@@ -209,7 +228,7 @@ with tab1:
             # Dedup by keeping the most recent hit per symbol within the timeframe
             action_hits = action_hits.drop_duplicates(subset=['Symbol'], keep='first')
             
-            X_live = action_hits[features].fillna(0)
+            X_live = action_hits[model_features].fillna(0)
             action_hits['ML Score (%)'] = safe_predict_proba(model, X_live)
             
             action_hits['Current_Price'] = action_hits['Symbol'].map(latest_prices)
@@ -356,14 +375,7 @@ with tab2:
         st.markdown("---")
         st.markdown("### Advanced ML Probability Filter & Backtesting")
         
-        features_list = [
-            'Vol_Surge', 'Del_Surge', 'Close_Location',
-            'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
-            'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
-            'Smart_Money_Score'
-        ]
-        
-        X_past = past_hits[features_list].fillna(0)
+        X_past = past_hits[model_features].fillna(0)
         past_hits['ML Score (%)'] = safe_predict_proba(model, X_past)
         
         col_m1, col_m2, col_m3 = st.columns(3)
@@ -515,26 +527,59 @@ with tab4:
 
 with tab5:
     st.subheader("Machine Learning Model Evaluation")
+    label_diagnostics = load_label_diagnostics()
+    if label_diagnostics is not None:
+        st.markdown("### Training Label Quality")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Usable Labels", f"{label_diagnostics.get('usable_training_labels', 0):,}")
+        with c2:
+            st.metric("Label Completeness", f"{label_diagnostics.get('label_completeness', 0):.2%}")
+        with c3:
+            st.metric("Positive Label Rate", f"{label_diagnostics.get('positive_label_rate', 0):.2%}")
+        with c4:
+            st.metric("Suspicious Return Labels", f"{label_diagnostics.get('suspicious_return_rate_gt_100pct', 0):.2%}")
     if metrics is not None:
         st.markdown("### Top Performing Models")
-        st.success(f"**Current Ensemble:** {metrics['top_models'][0]} & {metrics['top_models'][1]}")
+        top_models = metrics.get('top_models', [])
+        st.success(f"**Current Ensemble:** {' & '.join(top_models) if top_models else 'Not available'}")
         
         st.markdown("### Walk-Forward Cross Validation Performance")
-        scores = metrics['walk_forward_scores']
-        score_df = pd.DataFrame(list(scores.items()), columns=['Algorithm', 'Average Accuracy'])
-        score_df = score_df.sort_values('Average Accuracy', ascending=False)
-        st.dataframe(score_df.style.format({'Average Accuracy': '{:.2%}'}), width="stretch")
+        selection_metric = metrics.get('selection_metric', 'average_precision')
+        display_df = None
+        metric_labels = {
+            'average_precision': 'Average Precision',
+            'roc_auc': 'ROC AUC',
+            'f1': 'F1',
+            'balanced_accuracy': 'Balanced Accuracy',
+            'precision': 'Precision',
+            'recall': 'Recall',
+            'accuracy': 'Accuracy',
+        }
+        st.caption(f"Models are selected by {metric_labels.get(selection_metric, selection_metric)} because ML Score ranks breakout candidates by probability.")
+        if 'walk_forward_metrics' in metrics and metrics['walk_forward_metrics']:
+            score_df = pd.DataFrame.from_dict(metrics['walk_forward_metrics'], orient='index').reset_index(names='Algorithm')
+            metric_cols = ['average_precision', 'roc_auc', 'f1', 'balanced_accuracy', 'precision', 'recall', 'accuracy']
+            metric_cols = [col for col in metric_cols if col in score_df.columns]
+            score_df = score_df[['Algorithm'] + metric_cols]
+            score_df = score_df.sort_values(selection_metric, ascending=False)
+            display_df = score_df.rename(columns=metric_labels)
+            format_cols = {metric_labels.get(col, col): '{:.2%}' for col in metric_cols}
+            st.dataframe(display_df.style.format(format_cols), width="stretch")
+        else:
+            scores = metrics.get('walk_forward_scores', {})
+            score_df = pd.DataFrame(list(scores.items()), columns=['Algorithm', metric_labels.get(selection_metric, selection_metric)])
+            score_df = score_df.sort_values(metric_labels.get(selection_metric, selection_metric), ascending=False)
+            st.dataframe(score_df.style.format({metric_labels.get(selection_metric, selection_metric): '{:.2%}'}), width="stretch")
         
-        st.bar_chart(score_df.set_index('Algorithm'), height=400)
+        chart_col = metric_labels.get(selection_metric, selection_metric)
+        if display_df is not None and chart_col in display_df.columns:
+            st.bar_chart(display_df.set_index('Algorithm')[[chart_col]], height=400)
+        else:
+            st.bar_chart(score_df.set_index('Algorithm'), height=400)
         
         st.markdown("---")
         st.markdown("### Top Feature Importances")
-        
-        features_list = [
-            'Vol_Surge', 'Del_Surge', 'Close_Location', 'RS_1D', 'RS_5D', 'RS_20D', 
-            'ATR_30', 'BB_Width', 'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
-            'Smart_Money_Score'
-        ]
         
         importances = None
         if hasattr(model, 'feature_importances_'):
@@ -546,12 +591,15 @@ with tab5:
                     break
                     
         if importances is not None:
-            feat_df = pd.DataFrame({
-                'Feature': features_list,
-                'Importance': importances
-            }).sort_values('Importance', ascending=True)
-            
-            st.bar_chart(feat_df.set_index('Feature'), height=400)
+            if len(importances) == len(model_features):
+                feat_df = pd.DataFrame({
+                    'Feature': model_features,
+                    'Importance': importances
+                }).sort_values('Importance', ascending=True)
+                
+                st.bar_chart(feat_df.set_index('Feature'), height=400)
+            else:
+                st.info("Feature importances are unavailable because the saved model and feature list are out of sync. Run the pipeline again.")
         else:
             st.info("Feature importances not available for the current model ensemble.")
 

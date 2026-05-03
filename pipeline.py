@@ -11,8 +11,15 @@ import nselib
 from nselib import capital_market
 import yfinance as yf
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import LogisticRegression
@@ -24,6 +31,7 @@ import pickle
 import logging
 import json
 import warnings
+import re
 
 # Suppress pandas fragmentation warnings during the 30-day loop
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -34,37 +42,152 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 RAW_FILE = os.path.join(DATA_DIR, "raw_data.parquet")
 NIFTY_FILE = os.path.join(DATA_DIR, "nifty_data.parquet")
+CORPORATE_ACTIONS_FILE = os.path.join(DATA_DIR, "corporate_actions.parquet")
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed_data.parquet")
 MODEL_FILE = os.path.join(DATA_DIR, "xgb_model.pkl")
+LABEL_DIAGNOSTICS_FILE = os.path.join(DATA_DIR, "label_diagnostics.json")
+SELECTION_METRIC = "average_precision"
+MODEL_FEATURES = [
+    'Vol_Surge', 'Del_Surge', 'Close_Location',
+    'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
+    'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
+    'Smart_Money_Score', 'India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D'
+]
 
-def get_trading_days(start_date, end_date):
-    days = pd.date_range(start=start_date, end=end_date, freq='B')
-    return [d.strftime('%d-%m-%Y') for d in days]
+def clean_numeric_series(series):
+    return pd.to_numeric(series.astype(str).str.replace(',', '', regex=False).str.replace('-', '', regex=False), errors='coerce')
 
-def fetch_historical_bhavcopies(days_back=1250):
+def load_cached_nifty_benchmark():
+    if os.path.exists(NIFTY_FILE):
+        logging.warning("Using existing local benchmark file.")
+        return pd.read_parquet(NIFTY_FILE)
+    return pd.DataFrame()
+
+def standardize_nselib_benchmark(nifty, vix):
+    if nifty.empty:
+        return pd.DataFrame()
+
+    nifty = nifty.copy()
+    nifty['Date'] = pd.to_datetime(nifty['TIMESTAMP'], format='%d-%b-%Y', errors='coerce')
+    nifty['Nifty_Close'] = clean_numeric_series(nifty['CLOSE_INDEX_VAL'])
+    nifty = nifty[['Date', 'Nifty_Close']].dropna(subset=['Date', 'Nifty_Close'])
+    nifty = nifty.sort_values('Date').drop_duplicates(subset=['Date'], keep='last')
+    nifty['Nifty_EMA50'] = nifty['Nifty_Close'].ewm(span=50, adjust=False).mean()
+    nifty['Nifty_EMA200'] = nifty['Nifty_Close'].ewm(span=200, adjust=False).mean()
+
+    if not vix.empty:
+        vix = vix.copy()
+        vix['Date'] = pd.to_datetime(vix['TIMESTAMP'], format='%d-%b-%Y', errors='coerce')
+        vix['India_VIX'] = clean_numeric_series(vix['CLOSE_INDEX_VAL'])
+        vix = vix[['Date', 'India_VIX']].dropna(subset=['Date'])
+        vix = vix.sort_values('Date').drop_duplicates(subset=['Date'], keep='last')
+        nifty = pd.merge(nifty, vix, on='Date', how='left')
+    else:
+        nifty['India_VIX'] = np.nan
+
+    return nifty[['Date', 'Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200', 'India_VIX']]
+
+def fetch_nifty_benchmark_from_nselib(start_date, end_date):
+    chunk_start = start_date
+    nifty_parts = []
+    vix_parts = []
+
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=89), end_date)
+        from_date = chunk_start.strftime('%d-%m-%Y')
+        to_date = chunk_end.strftime('%d-%m-%Y')
+
+        nifty_chunk = capital_market.index_data(index='NIFTY 50', from_date=from_date, to_date=to_date)
+        if not nifty_chunk.empty:
+            nifty_parts.append(nifty_chunk)
+
+        try:
+            vix_chunk = capital_market.india_vix_data(from_date=from_date, to_date=to_date)
+            if not vix_chunk.empty:
+                vix_parts.append(vix_chunk)
+        except Exception as e:
+            logging.info(f"nselib India VIX unavailable for {from_date} to {to_date}; fallback will fill if needed. Detail: {e}")
+
+        chunk_start = chunk_end + timedelta(days=1)
+
+    nifty = pd.concat(nifty_parts, ignore_index=True) if nifty_parts else pd.DataFrame()
+    vix = pd.concat(vix_parts, ignore_index=True) if vix_parts else pd.DataFrame()
+    if vix.empty:
+        logging.info("nselib India VIX unavailable for all chunks. Trying VIX fallback.")
+    benchmark = standardize_nselib_benchmark(nifty, vix)
+    if benchmark.empty:
+        raise ValueError("nselib returned empty NIFTY benchmark data.")
+    if benchmark['India_VIX'].isna().any():
+        vix_fallback = fetch_vix_from_yahoo(start_date, end_date)
+        if not vix_fallback.empty:
+            benchmark = pd.merge(
+                benchmark,
+                vix_fallback.rename(columns={'India_VIX': 'India_VIX_Fallback'}),
+                on='Date',
+                how='left'
+            )
+            benchmark['India_VIX'] = benchmark['India_VIX'].combine_first(benchmark['India_VIX_Fallback'])
+            benchmark = benchmark.drop(columns=['India_VIX_Fallback'])
+    benchmark['India_VIX'] = benchmark['India_VIX'].ffill().bfill()
+    benchmark.to_parquet(NIFTY_FILE, index=False)
+    logging.info("Fetched Nifty 50 and India VIX benchmark data from nselib/NSE.")
+    return benchmark
+
+def fetch_vix_from_yahoo(start_date, end_date):
+    vix = yf.download('^INDIAVIX', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+    vix = vix.reset_index()
+    if vix.empty:
+        return pd.DataFrame()
+    if isinstance(vix.columns, pd.MultiIndex):
+        vix.columns = [col[0] if col[0] != 'Date' else 'Date' for col in vix.columns]
+    vix = vix.rename(columns={'Close': 'India_VIX'})
+    vix['Date'] = pd.to_datetime(vix['Date']).dt.tz_localize(None)
+    return vix[['Date', 'India_VIX']]
+
+def get_benchmark_trading_dates(nifty_df, days_back):
+    if nifty_df is None or nifty_df.empty or 'Date' not in nifty_df.columns:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back * 1.5)
+        days = pd.date_range(start=start_date, end=end_date, freq='B')
+        return pd.Series(days[-days_back:]).dt.normalize()
+    dates = pd.to_datetime(nifty_df['Date']).dt.tz_localize(None).dt.normalize()
+    return dates.dropna().drop_duplicates().sort_values().tail(days_back)
+
+def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
     """Fetches Bhavcopy with delivery for the last N trading days."""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back * 1.5)
-    
-    trading_dates = get_trading_days(start_date, end_date)[-days_back:]
+    trading_dates = get_benchmark_trading_dates(nifty_df, days_back)
     all_data = []
     
     if os.path.exists(RAW_FILE):
         logging.info("Loading existing raw data...")
         df_existing = pd.read_parquet(RAW_FILE)
         if 'Date' in df_existing.columns:
-            existing_dates = df_existing['Date'].dt.strftime('%d-%m-%Y').unique().tolist()
+            existing_dates = pd.to_datetime(df_existing['Date']).dt.normalize()
+            existing_date_set = set(existing_dates)
+            latest_existing_date = existing_dates.max()
         else:
-            existing_dates = []
+            existing_date_set = set()
+            latest_existing_date = pd.NaT
     else:
         df_existing = pd.DataFrame()
-        existing_dates = []
+        existing_date_set = set()
+        latest_existing_date = pd.NaT
 
-    dates_to_fetch = [d for d in trading_dates if d not in existing_dates]
+    backfill_missing_dates = os.environ.get('BACKFILL_MISSING_DATES', '0') == '1'
+    if len(existing_date_set) == 0:
+        dates_to_fetch = list(trading_dates)
+    elif backfill_missing_dates:
+        dates_to_fetch = [d for d in trading_dates if d not in existing_date_set]
+    else:
+        dates_to_fetch = [d for d in trading_dates if d > latest_existing_date]
+
     total_dates = len(dates_to_fetch)
     new_data_fetched = False
+    if total_dates == 0:
+        logging.info("Raw bhavcopy data is already in sync with the available NSE benchmark dates.")
     
-    for i, date_str in enumerate(dates_to_fetch):
+    for i, trading_date in enumerate(dates_to_fetch):
+        date_str = trading_date.strftime('%d-%m-%Y')
         logging.info(f"PROGRESS:{i}/{total_dates}")
         logging.info(f"Fetching data for {date_str}...")
         try:
@@ -101,7 +224,7 @@ def fetch_historical_bhavcopies(days_back=1250):
             df_day = df_day[req_cols]
             
             for col in ['Open', 'High', 'Low', 'Close', 'Volume', 'Turnover', 'Delivery_Volume', 'Delivery_Percent']:
-                df_day[col] = pd.to_numeric(df_day[col].astype(str).str.replace(',', '').str.replace('-', ''), errors='coerce')
+                df_day[col] = clean_numeric_series(df_day[col])
                 
             all_data.append(df_day)
             new_data_fetched = True
@@ -116,7 +239,11 @@ def fetch_historical_bhavcopies(days_back=1250):
                 
             time.sleep(0.5)
         except Exception as e:
-            logging.warning(f"Failed to fetch {date_str}: {e}")
+            message = str(e)
+            if "Data not found" in message:
+                logging.info(f"NSE has no bhavcopy delivery data for {date_str}; skipping.")
+            else:
+                logging.warning(f"Failed to fetch {date_str}: {e}")
             
     if total_dates > 0:
         logging.info(f"PROGRESS:{total_dates}/{total_dates}")
@@ -133,13 +260,18 @@ def fetch_nifty_benchmark(days_back=1250):
     logging.info("Fetching Nifty 50 and India VIX Benchmark Data...")
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back * 1.5)
+
+    try:
+        return fetch_nifty_benchmark_from_nselib(start_date, end_date)
+    except Exception as e:
+        logging.warning(f"nselib benchmark fetch failed: {e}. Trying Yahoo Finance.")
     
-    nifty = yf.download('^NSEI', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+    nifty = yf.download('^NSEI', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
     nifty = nifty.reset_index()
     
     if nifty.empty:
-        logging.warning("Failed to fetch Nifty data.")
-        return pd.DataFrame()
+        logging.warning("Failed to fetch Nifty data from Yahoo Finance.")
+        return load_cached_nifty_benchmark()
         
     if isinstance(nifty.columns, pd.MultiIndex):
         nifty.columns = [col[0] if col[0] != 'Date' else 'Date' for col in nifty.columns]
@@ -150,7 +282,7 @@ def fetch_nifty_benchmark(days_back=1250):
     nifty['Nifty_EMA50'] = nifty['Nifty_Close'].ewm(span=50, adjust=False).mean()
     nifty['Nifty_EMA200'] = nifty['Nifty_Close'].ewm(span=200, adjust=False).mean()
     
-    vix = yf.download('^INDIAVIX', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+    vix = yf.download('^INDIAVIX', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
     vix = vix.reset_index()
     if not vix.empty:
         if isinstance(vix.columns, pd.MultiIndex):
@@ -160,53 +292,155 @@ def fetch_nifty_benchmark(days_back=1250):
         nifty = pd.merge(nifty, vix[['Date', 'India_VIX']], on='Date', how='left')
     else:
         nifty['India_VIX'] = np.nan
-        
+
+    nifty = nifty.sort_values('Date')
+    nifty['India_VIX'] = nifty['India_VIX'].ffill().bfill()
     nifty = nifty[['Date', 'Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200', 'India_VIX']]
     nifty.to_parquet(NIFTY_FILE, index=False)
+    logging.info("Fetched Nifty 50 and India VIX benchmark data from Yahoo Finance.")
     return nifty
 
-def adjust_group_vectorized(df):
+def normalize_corporate_actions_columns(actions):
+    rename_map = {}
+    for col in actions.columns:
+        normalized = col.replace('-', '').replace('_', '').lower()
+        if normalized == 'symbol':
+            rename_map[col] = 'Symbol'
+        elif normalized in ['subject', 'purpose']:
+            rename_map[col] = 'Purpose'
+        elif normalized == 'exdate':
+            rename_map[col] = 'Ex-Date'
+        elif normalized == 'comp':
+            rename_map[col] = 'Company'
+        elif normalized == 'isin':
+            rename_map[col] = 'ISIN'
+    return actions.rename(columns=rename_map)
+
+def parse_corporate_action_factor(purpose):
+    text = str(purpose)
+    split_match = re.search(r'From\s+Rs\.?\s*(\d+(?:\.\d+)?)\s*/?-?\s*.*?\s+To\s+R(?:s|e)\.?\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if split_match:
+        old_face = float(split_match.group(1))
+        new_face = float(split_match.group(2))
+        if old_face > 0 and new_face > 0:
+            return old_face / new_face
+
+    bonus_match = re.search(r'\bBonus\s+(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if bonus_match:
+        bonus_shares = float(bonus_match.group(1))
+        existing_shares = float(bonus_match.group(2))
+        if existing_shares > 0:
+            return (bonus_shares + existing_shares) / existing_shares
+
+    return np.nan
+
+def fetch_corporate_actions(days_back=1250):
+    logging.info("Fetching NSE Corporate Actions for splits and bonuses...")
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back * 1.5)
+    chunk_start = start_date
+    parts = []
+
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=364), end_date)
+        from_date = chunk_start.strftime('%d-%m-%Y')
+        to_date = chunk_end.strftime('%d-%m-%Y')
+        try:
+            actions_chunk = capital_market.corporate_actions_for_equity(from_date=from_date, to_date=to_date)
+            if not actions_chunk.empty:
+                parts.append(actions_chunk)
+        except Exception as e:
+            logging.warning(f"Corporate actions fetch failed for {from_date} to {to_date}: {e}")
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if parts:
+        actions = pd.concat(parts, ignore_index=True)
+        actions = normalize_corporate_actions_columns(actions)
+        if {'Symbol', 'Purpose', 'Ex-Date'}.issubset(actions.columns):
+            actions['Ex-Date'] = pd.to_datetime(actions['Ex-Date'], errors='coerce')
+            actions['Adjustment_Factor'] = actions['Purpose'].apply(parse_corporate_action_factor)
+            actions = actions.dropna(subset=['Symbol', 'Ex-Date', 'Adjustment_Factor'])
+            actions = actions[actions['Adjustment_Factor'] > 0]
+            actions = actions.drop_duplicates(subset=['Symbol', 'Ex-Date', 'Purpose'])
+            actions.to_parquet(CORPORATE_ACTIONS_FILE, index=False)
+            logging.info(f"Loaded {len(actions)} split/bonus corporate actions from NSE.")
+            return actions
+
+    if os.path.exists(CORPORATE_ACTIONS_FILE):
+        logging.warning("Using existing local corporate actions file.")
+        actions = pd.read_parquet(CORPORATE_ACTIONS_FILE)
+        actions = normalize_corporate_actions_columns(actions)
+        if 'Adjustment_Factor' not in actions.columns and 'Purpose' in actions.columns:
+            actions['Adjustment_Factor'] = actions['Purpose'].apply(parse_corporate_action_factor)
+        actions['Ex-Date'] = pd.to_datetime(actions['Ex-Date'], errors='coerce')
+        return actions.dropna(subset=['Symbol', 'Ex-Date', 'Adjustment_Factor'])
+
+    logging.warning("No corporate actions data available. Prices will not be split/bonus adjusted.")
+    return pd.DataFrame(columns=['Symbol', 'Ex-Date', 'Purpose', 'Adjustment_Factor'])
+
+def adjust_group_with_corporate_actions(df, actions):
     df = df.sort_values('Date').reset_index(drop=True)
-    df['Prev_Close'] = df['Close'].shift(1)
-    df['Ratio'] = df['Prev_Close'] / (df['Open'] + 1e-8)
-    
-    common_ratios = np.array([2.0, 3.0, 4.0, 5.0, 10.0, 1.5, 1.25, 1.333, 2.5])
-    df['Adj_Factor'] = 1.0
-    mask = df['Ratio'] > 1.15
-    
-    if mask.any():
-        ratios = df.loc[mask, 'Ratio'].values
-        diff = np.abs(ratios[:, None] - common_ratios)
-        min_idx = np.argmin(diff, axis=1)
-        closest_ratios = common_ratios[min_idx]
-        
-        valid = (np.abs(closest_ratios - ratios) / closest_ratios) < 0.1
-        df.loc[df.index[mask][valid], 'Adj_Factor'] = closest_ratios[valid]
-        
-    df['Cum_Adj'] = df['Adj_Factor'].iloc[::-1].cumprod().iloc[::-1]
-    df['Cum_Adj'] = df['Cum_Adj'].shift(-1).fillna(1.0)
-    
+    df['Cum_Adj'] = 1.0
+
+    if not actions.empty:
+        symbol_actions = actions.sort_values('Ex-Date')
+        for _, action in symbol_actions.iterrows():
+            factor = action['Adjustment_Factor']
+            ex_date = action['Ex-Date']
+            if pd.notna(factor) and factor > 0 and pd.notna(ex_date):
+                df.loc[df['Date'] < ex_date, 'Cum_Adj'] *= factor
+
     df['Open'] = df['Open'] / df['Cum_Adj']
     df['High'] = df['High'] / df['Cum_Adj']
     df['Low'] = df['Low'] / df['Cum_Adj']
     df['Close'] = df['Close'] / df['Cum_Adj']
     df['Volume'] = df['Volume'] * df['Cum_Adj']
     df['Delivery_Volume'] = df['Delivery_Volume'] * df['Cum_Adj']
-    
-    return df.drop(columns=['Prev_Close', 'Ratio', 'Adj_Factor', 'Cum_Adj'])
 
-def apply_corporate_action_adjustments(df):
-    logging.info("Applying Corporate Action Adjustments (Splits/Bonuses)...")
-    adjusted_df = df.groupby('Symbol', group_keys=True).apply(adjust_group_vectorized).reset_index(level=0)
+    return df.drop(columns=['Cum_Adj'])
+
+def apply_corporate_action_adjustments(df, corporate_actions):
+    logging.info("Applying NSE Corporate Action Adjustments (Splits/Bonuses)...")
+    corporate_actions = normalize_corporate_actions_columns(corporate_actions.copy())
+    if not corporate_actions.empty:
+        corporate_actions['Ex-Date'] = pd.to_datetime(corporate_actions['Ex-Date'], errors='coerce')
+        if 'Adjustment_Factor' not in corporate_actions.columns:
+            corporate_actions['Adjustment_Factor'] = corporate_actions['Purpose'].apply(parse_corporate_action_factor)
+        corporate_actions = corporate_actions.dropna(subset=['Symbol', 'Ex-Date', 'Adjustment_Factor'])
+        corporate_actions = corporate_actions[corporate_actions['Adjustment_Factor'] > 0]
+    actions_by_symbol = {symbol: group for symbol, group in corporate_actions.groupby('Symbol')}
+
+    adjusted_df = (
+        df.groupby('Symbol', group_keys=True)
+        .apply(lambda g: adjust_group_with_corporate_actions(g, actions_by_symbol.get(g.name, pd.DataFrame())))
+        .reset_index(level=0)
+    )
     return adjusted_df.reset_index(drop=True)
 
 def engineer_features(df, nifty_df):
     logging.info("Engineering Features and Screener Logic...")
+    if nifty_df.empty:
+        raise ValueError("Nifty benchmark data is empty; run the pipeline with network access or restore data/nifty_data.parquet.")
     
     df['Date'] = pd.to_datetime(df['Date'])
     nifty_df['Date'] = pd.to_datetime(nifty_df['Date'])
+    benchmark_cols = ['Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200', 'India_VIX']
+    missing_benchmark_cols = [col for col in benchmark_cols if col not in nifty_df.columns]
+    if missing_benchmark_cols:
+        raise ValueError(f"Missing benchmark columns: {missing_benchmark_cols}")
+    if nifty_df[['Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200']].isna().any().any():
+        raise ValueError("Nifty benchmark data contains missing values; cannot calculate relative strength reliably.")
+    if nifty_df['India_VIX'].isna().all():
+        logging.warning("India VIX data is unavailable. VIX features will be neutralized.")
+        nifty_df['India_VIX'] = 0.0
+    else:
+        nifty_df['India_VIX'] = nifty_df['India_VIX'].ffill().bfill()
     
-    df = pd.merge(df, nifty_df, on='Date', how='left')
+    df = pd.merge(df, nifty_df, on='Date', how='left').sort_values(['Date', 'Symbol'])
+    missing_nifty_ratio = df['Nifty_Close'].isna().mean()
+    if missing_nifty_ratio > 0.05:
+        raise ValueError(f"Nifty benchmark merge failed for {missing_nifty_ratio:.1%} of stock rows.")
+    df[benchmark_cols] = df[benchmark_cols].ffill().bfill()
     df = df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
     
     def calculate_indicators(g):
@@ -246,6 +480,8 @@ def engineer_features(df, nifty_df):
             
         g['Nifty_vs_EMA50'] = g['Nifty_Close'] / (g['Nifty_EMA50'] + 1e-8) - 1
         g['Nifty_vs_EMA200'] = g['Nifty_Close'] / (g['Nifty_EMA200'] + 1e-8) - 1
+        g['VIX_Change_5D'] = g['India_VIX'].pct_change(5)
+        g['VIX_Rank_252D'] = g['India_VIX'].rolling(252, min_periods=20).rank(pct=True)
         
         g['High_52W'] = g['High'].rolling(252, min_periods=20).max()
         g['Dist_From_52W_High'] = g['Close'] / (g['High_52W'] + 1e-8) - 1
@@ -295,7 +531,11 @@ def engineer_features(df, nifty_df):
             g[f'Max_Return_{i}D'] = fut_high / (g['Entry_Price'] + 1e-8) - 1
             g[f'Max_Drawdown_{i}D'] = fut_low / (g['Entry_Price'] + 1e-8) - 1
             
-        g['Target_Success'] = (g['Max_Return_10D'] > 0.05).astype(int)
+        g['Target_Success'] = np.where(
+            g['Entry_Price'].notna() & g['Max_Return_10D'].notna(),
+            (g['Max_Return_10D'] > 0.05).astype(int),
+            np.nan
+        )
         
         return g
         
@@ -304,16 +544,64 @@ def engineer_features(df, nifty_df):
     processed_df.to_parquet(PROCESSED_FILE, index=False)
     return processed_df
 
+def write_label_diagnostics(df):
+    hits = df[df['Screener_Hit'] == True].copy()
+    if hits.empty:
+        diagnostics = {
+            'total_screener_hits': 0,
+            'usable_training_labels': 0,
+            'label_completeness': 0.0,
+            'positive_label_rate': 0.0,
+            'suspicious_return_rate_gt_100pct': 0.0,
+            'suspicious_drawdown_rate_lt_minus_50pct': 0.0,
+        }
+    else:
+        max_date = hits['Date'].max()
+        mature_hits = hits[hits['Date'] <= (max_date - pd.Timedelta(days=15))]
+        usable = mature_hits.dropna(subset=['Entry_Price', 'Max_Return_10D', 'Max_Drawdown_10D', 'Target_Success'])
+        diagnostics = {
+            'total_screener_hits': int(len(hits)),
+            'mature_screener_hits': int(len(mature_hits)),
+            'usable_training_labels': int(len(usable)),
+            'label_completeness': float(len(usable) / len(mature_hits)) if len(mature_hits) else 0.0,
+            'positive_label_rate': float(usable['Target_Success'].mean()) if len(usable) else 0.0,
+            'suspicious_return_rate_gt_100pct': float((usable['Max_Return_10D'] > 1.0).mean()) if len(usable) else 0.0,
+            'suspicious_drawdown_rate_lt_minus_50pct': float((usable['Max_Drawdown_10D'] < -0.5).mean()) if len(usable) else 0.0,
+            'label_definition': 'Buy next trading day open after Screener_Hit; positive if Max_Return_10D exceeds 5%. Incomplete future labels are excluded from training.',
+        }
+    with open(LABEL_DIAGNOSTICS_FILE, "w") as f:
+        json.dump(diagnostics, f, indent=2)
+    logging.info(f"Label Diagnostics: {diagnostics}")
+
+def calculate_classification_metrics(y_true, preds, probabilities):
+    metrics = {
+        'accuracy': accuracy_score(y_true, preds),
+        'balanced_accuracy': balanced_accuracy_score(y_true, preds),
+        'precision': precision_score(y_true, preds, zero_division=0),
+        'recall': recall_score(y_true, preds, zero_division=0),
+        'f1': f1_score(y_true, preds, zero_division=0),
+    }
+    if probabilities is not None and len(np.unique(y_true)) == 2:
+        metrics['roc_auc'] = roc_auc_score(y_true, probabilities)
+        metrics['average_precision'] = average_precision_score(y_true, probabilities)
+    else:
+        metrics['roc_auc'] = 0.0
+        metrics['average_precision'] = 0.0
+    return {key: float(value) for key, value in metrics.items()}
+
+def model_probabilities(model, X):
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(X)
+        return 1 / (1 + np.exp(-scores))
+    return None
+
 def train_model(df):
     logging.info("Training and Evaluating ML Models with Walk-Forward Validation...")
     train_data = df[df['Screener_Hit'] == True].copy()
     
-    features = [
-        'Vol_Surge', 'Del_Surge', 'Close_Location',
-        'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
-        'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
-        'Smart_Money_Score'
-    ]
+    features = MODEL_FEATURES
     
     train_data = train_data.replace([np.inf, -np.inf], np.nan)
     train_data = train_data.dropna(subset=features + ['Target_Success'])
@@ -328,6 +616,16 @@ def train_model(df):
         X_dummy = pd.DataFrame(np.random.rand(10, len(features)), columns=features)
         y_dummy = np.random.randint(0, 2, 10)
         model.fit(X_dummy, y_dummy)
+        metrics_data = {
+            'walk_forward_metrics': {},
+            'walk_forward_scores': {},
+            'selection_metric': SELECTION_METRIC,
+            'features': features,
+            'top_models': ['FallbackDummy'],
+            'warning': 'Not enough screener hits to train a reliable model.'
+        }
+        with open(os.path.join(DATA_DIR, "ml_metrics.json"), "w") as f:
+            json.dump(metrics_data, f)
         with open(MODEL_FILE, 'wb') as f:
             pickle.dump(model, f)
         return model
@@ -355,7 +653,7 @@ def train_model(df):
     train_data['Year'] = train_data['Date'].dt.year
     years = sorted(train_data['Year'].unique())
     
-    model_scores = {name: [] for name in models.keys()}
+    model_fold_metrics = {name: [] for name in models.keys()}
     
     # Need at least 2 years for walk forward
     if len(years) >= 2:
@@ -380,33 +678,55 @@ def train_model(df):
                 try:
                     model.fit(X_tr, y_tr)
                     preds = model.predict(X_te)
-                    acc = accuracy_score(y_te, preds)
-                    model_scores[name].append(acc)
+                    probabilities = model_probabilities(model, X_te)
+                    model_fold_metrics[name].append(calculate_classification_metrics(y_te, preds, probabilities))
                 except Exception as e:
                     logging.warning(f"Model {name} failed on year {test_year}: {e}")
-                    model_scores[name].append(0)
+                    model_fold_metrics[name].append({
+                        'accuracy': 0.0,
+                        'balanced_accuracy': 0.0,
+                        'precision': 0.0,
+                        'recall': 0.0,
+                        'f1': 0.0,
+                        'roc_auc': 0.0,
+                        'average_precision': 0.0,
+                    })
                     
-        # Average the scores
-        avg_scores = {}
-        for name, scores in model_scores.items():
-            if len(scores) > 0:
-                avg_scores[name] = np.mean(scores)
+        # Average each out-of-sample metric across walk-forward folds.
+        avg_metrics = {}
+        for name, folds in model_fold_metrics.items():
+            if len(folds) > 0:
+                avg_metrics[name] = {
+                    metric: float(np.mean([fold[metric] for fold in folds]))
+                    for metric in folds[0].keys()
+                }
             else:
-                avg_scores[name] = 0
+                avg_metrics[name] = {
+                    'accuracy': 0.0,
+                    'balanced_accuracy': 0.0,
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'f1': 0.0,
+                    'roc_auc': 0.0,
+                    'average_precision': 0.0,
+                }
                 
-        logging.info(f"Walk-Forward Validation Accuracy Scores: {avg_scores}")
+        logging.info(f"Walk-Forward Validation Metrics: {avg_metrics}")
         
-        # Select Top 2 models
-        sorted_models = sorted(avg_scores.items(), key=lambda item: item[1], reverse=True)
+        # Select models by average precision because the dashboard ranks trades by probability.
+        sorted_models = sorted(avg_metrics.items(), key=lambda item: item[1][SELECTION_METRIC], reverse=True)
         top1_name = sorted_models[0][0]
         top2_name = sorted_models[1][0]
-        logging.info(f"Selected Top 2 Models: {top1_name} and {top2_name}")
+        logging.info(f"Selected Top 2 Models by {SELECTION_METRIC}: {top1_name} and {top2_name}")
         
         top1_model = models[top1_name]
         top2_model = models[top2_name]
         
         metrics_data = {
-            'walk_forward_scores': avg_scores,
+            'walk_forward_metrics': avg_metrics,
+            'walk_forward_scores': {name: values[SELECTION_METRIC] for name, values in avg_metrics.items()},
+            'selection_metric': SELECTION_METRIC,
+            'features': features,
             'top_models': [top1_name, top2_name]
         }
         with open(os.path.join(DATA_DIR, "ml_metrics.json"), "w") as f:
@@ -420,7 +740,21 @@ def train_model(df):
         top1_name, top2_name = 'XGBoost', 'RandomForest'
 
         metrics_data = {
+            'walk_forward_metrics': {
+                name: {
+                    'accuracy': 0.0,
+                    'balanced_accuracy': 0.0,
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'f1': 0.0,
+                    'roc_auc': 0.0,
+                    'average_precision': 0.0,
+                }
+                for name in models.keys()
+            },
             'walk_forward_scores': {'XGBoost': 0, 'RandomForest': 0, 'NeuralNetwork': 0, 'LogisticRegression': 0, 'SVM': 0},
+            'selection_metric': SELECTION_METRIC,
+            'features': features,
             'top_models': [top1_name, top2_name]
         }
         with open(os.path.join(DATA_DIR, "ml_metrics.json"), "w") as f:
@@ -438,9 +772,11 @@ def train_model(df):
     
     ensemble.fit(X_full, y_full)
     
-    # Evaluate on whole set just for reporting
+    # Evaluate on whole set only as an overfit diagnostic; model selection uses walk-forward metrics above.
     preds_full = ensemble.predict(X_full)
-    logging.info(f"Final Ensemble Model Training Accuracy: {accuracy_score(y_full, preds_full):.2f}")
+    prob_full = model_probabilities(ensemble, X_full)
+    train_metrics = calculate_classification_metrics(y_full, preds_full, prob_full)
+    logging.info(f"Final Ensemble Training Diagnostics: {train_metrics}")
     
     with open(MODEL_FILE, 'wb') as f:
         pickle.dump(ensemble, f)
@@ -454,14 +790,16 @@ def main():
     logging.info(f"Configured to fetch {DAYS_TO_FETCH} trading days.")
     
     nifty_df = fetch_nifty_benchmark(days_back=DAYS_TO_FETCH)
-    raw_df = fetch_historical_bhavcopies(days_back=DAYS_TO_FETCH)
+    corporate_actions = fetch_corporate_actions(days_back=DAYS_TO_FETCH)
+    raw_df = fetch_historical_bhavcopies(days_back=DAYS_TO_FETCH, nifty_df=nifty_df)
     
     if raw_df.empty:
         logging.error("Failed to fetch equity data.")
         return
         
-    adjusted_df = apply_corporate_action_adjustments(raw_df)
+    adjusted_df = apply_corporate_action_adjustments(raw_df, corporate_actions)
     processed_df = engineer_features(adjusted_df, nifty_df)
+    write_label_diagnostics(processed_df)
     model = train_model(processed_df)
     
     logging.info("Pipeline Execution Completed. Run 'streamlit run app.py' to view the dashboard.")
