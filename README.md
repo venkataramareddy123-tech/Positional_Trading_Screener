@@ -48,7 +48,7 @@ chmod +x run.sh
 ---
 
 ## 🛠️ Tech Stack
-*   **ML:** XGBoost, LightGBM, CatBoost, Scikit-Learn
+*   **ML:** XGBoost, Random Forest, LightGBM, CatBoost, Scikit-Learn
 *   **Data:** Pandas, PyArrow, Nselib, YFinance
 *   **UI:** Streamlit (Custom Dark Theme)
 

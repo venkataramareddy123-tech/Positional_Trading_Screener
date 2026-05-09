@@ -36,16 +36,17 @@ The platform hunts for two completely different trading setups, displayed side-b
 *The Action List hunts for stocks that are breaking out **today**. These are momentum plays ready for immediate execution.*
 To trigger an Action List alert, a stock must meet core institutional criteria:
 1. **Volume Surge > 1.5x:** The stock traded more than 50% above its 30-day average volume OR its 30-day average delivery volume.
-2. **Close > VWAP:** The stock must close the day above its Volume Weighted Average Price, proving that buyers maintained control until the closing bell.
+2. **Close > VWAP:** The stock must close the day above its Volume Weighted Average Price, proving that buyers maintained control.
 3. **Top 10% of Daily Range:** The closing price must be in the absolute top 10% of the daily candle (High minus Low).
+4. **Bullish Trend:** Must be trading above the **200-day EMA**.
+5. **Quality Filter:** Must have a **Smart Money Score >= 60**.
 
 ### B. The Stealth Watchlist (Smart Money)
 *The Stealth Watchlist hunts for stocks that show massive institutional accumulation behind the scenes without a price breakout yet.*
-It triggers when a stock scores **high** on the proprietary Smart Money Algorithm:
-1. **Delivery Anomaly:** Surge in the 5-day Delivery % vs 50-day baseline.
-2. **Volume-Price Trend:** Higher volume on Green days than Red days.
-3. **Volatility Contraction:** Narrowing Bollinger Bands (The Squeeze).
-4. **50-EMA Defense:** Staying above the institutional support line.
+It triggers when a stock meets these high-conviction "Smart Money" thresholds:
+1. **Accumulation Score >= 75:** High scores on delivery anomalies, volume trends, and squeeze metrics.
+2. **Institutional Support:** Must be trading above the **200-day EMA**.
+3. **Stealth Mode:** Only triggers if the stock is **not** already hitting the Action List (it's "pre-breakout").
 
 ---
 
