@@ -37,6 +37,6 @@ python pipeline.py
 
 echo.
 echo Starting Streamlit Dashboard...
-streamlit run app.py
+python -m streamlit run app.py
 
 pause
