@@ -8,3 +8,5 @@ fastparquet
 ta
 scikit-learn
 yfinance
+catboost
+lightgbm

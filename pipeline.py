@@ -11,6 +11,8 @@ import nselib
 from nselib import capital_market
 import yfinance as yf
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -51,11 +53,46 @@ MODEL_FEATURES = [
     'Vol_Surge', 'Del_Surge', 'Close_Location',
     'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
     'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
-    'Smart_Money_Score', 'India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D'
+    'Smart_Money_Score', 'Is_Inst_Buy', 'Inst_Intensity', 
+    'Del_Anomaly', 'Vol_Trend', 'Dist_From_EMA50',
+    'India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D'
 ]
 
 def clean_numeric_series(series):
     return pd.to_numeric(series.astype(str).str.replace(',', '', regex=False).str.replace('-', '', regex=False), errors='coerce')
+
+def is_etf_or_commodity(symbol):
+    """Identifies if a symbol is an ETF, Bond, Gold/Silver linked security, REIT, InvIT, etc."""
+    symbol = str(symbol).upper().strip()
+    
+    whitelist = {
+        'GOLDIAM', 'SKYGOLD', 'JETFREIGHT', 'GOLDTECH', 'SILVERTUC', 
+        'GOLDENTOBC', 'SILVERTOUCH', 'AONEGOLD', 'SHANTIGOLD', 
+        'CHOICEGOLD', 'UNIONGOLD', 'GOLD', 'MUTHOOTFIN', 'MANAPPURAM'
+    }
+    if symbol in whitelist:
+        return False
+        
+    if symbol.endswith('ETF') or symbol.endswith('BEES') or symbol.startswith('SGB'):
+        return True
+        
+    bad_substrings = [
+        'LIQUID', 'INVIT', 'REIT', 'NIFTY', 'INDEX', 'SENSEX', 'GILT', 'ETF', 'BEES', 'FUND', 'BONDS'
+    ]
+    for sub in bad_substrings:
+        if sub in symbol:
+            return True
+            
+    if 'SILVER' in symbol:
+        return True
+    if 'GOLD' in symbol and symbol not in whitelist:
+        return True
+        
+    import re
+    if re.search(r'\d+GS\d+', symbol) or re.search(r'SGB\w{3}\d{2}', symbol):
+        return True
+        
+    return False
 
 def load_cached_nifty_benchmark():
     if os.path.exists(NIFTY_FILE):
@@ -161,6 +198,8 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
     if os.path.exists(RAW_FILE):
         logging.info("Loading existing raw data...")
         df_existing = pd.read_parquet(RAW_FILE)
+        # Filter existing data for ETFs
+        df_existing = df_existing[~df_existing['Symbol'].apply(is_etf_or_commodity)]
         if 'Date' in df_existing.columns:
             existing_dates = pd.to_datetime(df_existing['Date']).dt.normalize()
             existing_date_set = set(existing_dates)
@@ -212,6 +251,9 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
             
             if 'SERIES' in df_day.columns:
                 df_day = df_day[df_day['SERIES'] == 'EQ']
+            
+            # Filter ETFs and Commodity-linked securities
+            df_day = df_day[~df_day['Symbol'].apply(is_etf_or_commodity)]
             
             df_day = df_day.rename(columns=col_map)
             df_day['Date'] = pd.to_datetime(date_str, format='%d-%m-%Y')
@@ -380,7 +422,7 @@ def fetch_corporate_actions(days_back=1250):
 
 def adjust_group_with_corporate_actions(df, actions):
     df = df.sort_values('Date').reset_index(drop=True)
-    df['Cum_Adj'] = 1.0
+    df['Adj_Factor'] = 1.0
 
     if not actions.empty:
         symbol_actions = actions.sort_values('Ex-Date')
@@ -388,16 +430,16 @@ def adjust_group_with_corporate_actions(df, actions):
             factor = action['Adjustment_Factor']
             ex_date = action['Ex-Date']
             if pd.notna(factor) and factor > 0 and pd.notna(ex_date):
-                df.loc[df['Date'] < ex_date, 'Cum_Adj'] *= factor
+                df.loc[df['Date'] < ex_date, 'Adj_Factor'] *= factor
 
-    df['Open'] = df['Open'] / df['Cum_Adj']
-    df['High'] = df['High'] / df['Cum_Adj']
-    df['Low'] = df['Low'] / df['Cum_Adj']
-    df['Close'] = df['Close'] / df['Cum_Adj']
-    df['Volume'] = df['Volume'] * df['Cum_Adj']
-    df['Delivery_Volume'] = df['Delivery_Volume'] * df['Cum_Adj']
+    df['Open'] = df['Open'] / df['Adj_Factor']
+    df['High'] = df['High'] / df['Adj_Factor']
+    df['Low'] = df['Low'] / df['Adj_Factor']
+    df['Close'] = df['Close'] / df['Adj_Factor']
+    df['Volume'] = df['Volume'] * df['Adj_Factor']
+    df['Delivery_Volume'] = df['Delivery_Volume'] * df['Adj_Factor']
 
-    return df.drop(columns=['Cum_Adj'])
+    return df
 
 def apply_corporate_action_adjustments(df, corporate_actions):
     logging.info("Applying NSE Corporate Action Adjustments (Splits/Bonuses)...")
@@ -419,6 +461,9 @@ def apply_corporate_action_adjustments(df, corporate_actions):
 
 def engineer_features(df, nifty_df):
     logging.info("Engineering Features and Screener Logic...")
+    # Final safety filter to ensure no ETFs/Commodities are in the training set
+    df = df[~df['Symbol'].apply(is_etf_or_commodity)].copy()
+    
     if nifty_df.empty:
         raise ValueError("Nifty benchmark data is empty; run the pipeline with network access or restore data/nifty_data.parquet.")
     
@@ -459,17 +504,7 @@ def engineer_features(df, nifty_df):
         g['Close_Location'] = (g['Close'] - g['Low']) / (g['Daily_Range'] + 1e-8)
         g['Top_10_Percent'] = g['Close_Location'] >= 0.90
         
-        g['Screener_Hit'] = (
-            ((g['Vol_Surge'] > 2.0) | (g['Del_Surge'] > 2.0)) & 
-            (g['Close'] > g['VWAP']) & 
-            g['Top_10_Percent']
-        )
-        
-        for window in [1, 5, 20]:
-            stock_ret = g['Close'].pct_change(window)
-            nifty_ret = g['Nifty_Close'].pct_change(window)
-            g[f'RS_{window}D'] = stock_ret - nifty_ret
-            
+        # --- CORE INDICATORS (Needed for filters and R:R) ---
         try:
             g['ATR_30'] = ta.volatility.average_true_range(g['High'], g['Low'], g['Close'], window=30, fillna=True)
             indicator_bb = ta.volatility.BollingerBands(close=g['Close'], window=30, window_dev=2, fillna=True)
@@ -478,74 +513,165 @@ def engineer_features(df, nifty_df):
             g['ATR_30'] = np.nan
             g['BB_Width'] = np.nan
             
-        g['Nifty_vs_EMA50'] = g['Nifty_Close'] / (g['Nifty_EMA50'] + 1e-8) - 1
-        g['Nifty_vs_EMA200'] = g['Nifty_Close'] / (g['Nifty_EMA200'] + 1e-8) - 1
-        g['VIX_Change_5D'] = g['India_VIX'].pct_change(5)
-        g['VIX_Rank_252D'] = g['India_VIX'].rolling(252, min_periods=20).rank(pct=True)
+        g['EMA_50'] = g['Close'].ewm(span=50, adjust=False).mean()
+        g['EMA_200'] = g['Close'].ewm(span=200, adjust=False).mean()
+        g['Above_EMA50'] = (g['Close'] > g['EMA_50']).astype(int)
+        g['Institutional_Trend'] = (g['Close'] > g['EMA_200']) & (g['EMA_50'] > g['EMA_200'])
         
-        g['High_52W'] = g['High'].rolling(252, min_periods=20).max()
-        g['Dist_From_52W_High'] = g['Close'] / (g['High_52W'] + 1e-8) - 1
-        
-        # --- SMART MONEY ACCUMULATION SCORE ---
-        # 1. Delivery Percentage Anomaly
+        # --- SMART MONEY ACCUMULATION SCORE (0-100) ---
         g['Del_Pct'] = g['Delivery_Volume'] / (g['Volume'] + 1e-8)
         g['Del_Pct_5D'] = g['Del_Pct'].rolling(5).mean()
         g['Del_Pct_50D'] = g['Del_Pct'].rolling(50, min_periods=10).mean()
         g['Del_Anomaly'] = g['Del_Pct_5D'] / (g['Del_Pct_50D'] + 1e-8)
         
-        # 2. Volume-Price Divergence (Up Vol vs Down Vol)
         up_vol = np.where(g['Close'] > g['Close'].shift(1), g['Volume'], 0)
         down_vol = np.where(g['Close'] < g['Close'].shift(1), g['Volume'], 0)
         g['Up_Vol_15D'] = pd.Series(up_vol, index=g.index).rolling(15, min_periods=5).sum()
         g['Down_Vol_15D'] = pd.Series(down_vol, index=g.index).rolling(15, min_periods=5).sum()
         g['Vol_Trend'] = g['Up_Vol_15D'] / (g['Down_Vol_15D'] + 1e-8)
         
-        # 3. Volatility Contraction (Bollinger Squeeze Rank)
         if 'BB_Width' in g.columns:
             g['BB_Squeeze_Rank'] = g['BB_Width'].rolling(120, min_periods=30).rank(pct=True)
             g['Squeeze_Score'] = 1.0 - g['BB_Squeeze_Rank']
         else:
             g['Squeeze_Score'] = 0.0
             
-        # 4. 50-EMA Defense
-        g['EMA_50'] = g['Close'].ewm(span=50, adjust=False).mean()
-        g['Above_EMA50'] = (g['Close'] > g['EMA_50']).astype(int)
-        
-        # Calculate Composite Score (0-100)
-        score_del = np.clip((g['Del_Anomaly'] - 1.0) / 1.5, 0, 1) * 30    # Max 30 pts
-        score_vol = np.clip((g['Vol_Trend'] - 1.0) / 2.0, 0, 1) * 30      # Max 30 pts
-        score_sqz = g['Squeeze_Score'].fillna(0) * 30                     # Max 30 pts
-        score_ema = g['Above_EMA50'] * 10                                 # Max 10 pts
-        
+        score_del = np.clip((g['Del_Anomaly'] - 1.0) / 1.5, 0, 1) * 30
+        score_vol = np.clip((g['Vol_Trend'] - 1.0) / 2.0, 0, 1) * 30
+        score_sqz = g['Squeeze_Score'].fillna(0) * 30
+        score_ema = g['Above_EMA50'] * 10
         g['Smart_Money_Score'] = (score_del + score_vol + score_sqz + score_ema).round(2)
         
-        # The Watchlist Trigger
-        g['Smart_Money_Hit'] = (g['Smart_Money_Score'] >= 80) & (g['Screener_Hit'] == False)
+        # --- SCREENER HITS (The "Action" and "Stealth" Signals) ---
+        g['Screener_Hit'] = (
+            ((g['Vol_Surge'] > 1.5) | (g['Del_Surge'] > 1.5)) & 
+            (g['Close'] > g['VWAP']) & 
+            g['Top_10_Percent'] &
+            (g['Close'] > g['EMA_200']) &
+            (g['Smart_Money_Score'] >= 60)
+        )
         
-        # Buy at the Open of the NEXT day after the signal
+        g['Smart_Money_Hit'] = (g['Smart_Money_Score'] >= 75) & (g['Screener_Hit'] == False) & (g['Close'] > g['EMA_200'])
+        g['Signal'] = g['Screener_Hit'] | g['Smart_Money_Hit']
+        g['First_Hit'] = g['Signal'] & (g['Signal'].rolling(window=6).sum() <= 1)
+        
+        # --- RELATIVE STRENGTH & BENCHMARK ---
+        for window in [1, 5, 20, 126]:
+            stock_ret = g['Close'].pct_change(window)
+            nifty_ret = g['Nifty_Close'].pct_change(window)
+            g[f'RS_{window}D'] = stock_ret - nifty_ret
+            
+        g['Dist_From_EMA50'] = g['Close'] / (g['EMA_50'] + 1e-8) - 1
+        g['Is_Inst_Buy'] = ((g['Close'] > g['EMA_200']) & (g['Smart_Money_Score'] >= 65)).astype(int)
+        g['Inst_Intensity'] = (g['Vol_Surge'] + g['Del_Surge']) / 2.0
+
+        g['Nifty_vs_EMA50'] = g['Nifty_Close'] / (g['Nifty_EMA50'] + 1e-8) - 1
+        g['Nifty_vs_EMA200'] = g['Nifty_Close'] / (g['Nifty_EMA200'] + 1e-8) - 1
+        g['VIX_Change_5D'] = g['India_VIX'].pct_change(5)
+        g['VIX_Rank_252D'] = g['India_VIX'].rolling(252, min_periods=20).rank(pct=True)
+        g['High_52W'] = g['High'].rolling(252, min_periods=20).max()
+        g['Dist_From_52W_High'] = g['Close'] / (g['High_52W'] + 1e-8) - 1
+        
+        # --- BACKTESTING / LABELING ---
         g['Entry_Price'] = g['Open'].shift(-1)
         
-        for i in range(1, 31):
+        # Keep key forward windows for diagnostics/forensics
+        for i in [10, 20, 30]:
             fut_high = g['High'].shift(-1)[::-1].rolling(i, min_periods=1).max()[::-1]
             fut_low = g['Low'].shift(-1)[::-1].rolling(i, min_periods=1).min()[::-1]
             g[f'Max_Return_{i}D'] = fut_high / (g['Entry_Price'] + 1e-8) - 1
             g[f'Max_Drawdown_{i}D'] = fut_low / (g['Entry_Price'] + 1e-8) - 1
             
-        g['Target_Success'] = np.where(
-            g['Entry_Price'].notna() & g['Max_Return_10D'].notna(),
-            (g['Max_Return_10D'] > 0.05).astype(int),
-            np.nan
-        )
-        
+        def determine_pro_swing_success(group):
+            """
+            Original labeling logic: Fixed +15% Target vs 2.0x ATR Stop Loss.
+            Optimized with numpy for fast processing.
+            """
+            labels = np.full(len(group), np.nan)
+            returns = np.full(len(group), np.nan)
+            exit_dates = pd.Series([pd.NaT] * len(group), index=group.index)
+            
+            hit_indices = np.where(group['First_Hit'] == True)[0]
+            if len(hit_indices) == 0:
+                return pd.DataFrame({'Target_Success': labels, 'Realized_Return': returns, 'Exit_Date': exit_dates}, index=group.index)
+                
+            opens = group['Open'].values
+            highs = group['High'].values
+            lows = group['Low'].values
+            closes = group['Close'].values
+            atrs = group['ATR_30'].values
+            dates = group['Date'].values
+            n = len(group)
+            
+            for pos in hit_indices:
+                if pos + 1 >= n: continue
+                
+                entry_price = opens[pos + 1]
+                atr_at_entry = atrs[pos]
+                if pd.isna(entry_price) or pd.isna(atr_at_entry): continue
+                
+                # Original Fixed Rules
+                stop_dist = 2.0 * atr_at_entry
+                actual_stop_pct = max(0.03, min(0.10, stop_dist / (entry_price + 1e-8)))
+                stop_price = entry_price * (1 - actual_stop_pct)
+                target_price = entry_price * 1.15
+                
+                final_label = 0
+                final_return = -actual_stop_pct
+                final_exit_date = dates[min(pos + 20, n - 1)]
+                
+                for d in range(1, 21):
+                    curr_idx = pos + d
+                    if curr_idx >= n: break
+                    
+                    if highs[curr_idx] >= target_price:
+                        final_label = 1
+                        final_return = 0.15
+                        final_exit_date = dates[curr_idx]
+                        break
+                    
+                    if lows[curr_idx] <= stop_price:
+                        final_label = 0
+                        final_return = -actual_stop_pct
+                        final_exit_date = dates[curr_idx]
+                        break
+                        
+                    if d == 20:
+                        final_return = (closes[curr_idx] / entry_price) - 1
+                        final_label = 1 if final_return >= 0.05 else 0
+                        final_exit_date = dates[curr_idx]
+                
+                labels[pos] = final_label
+                returns[pos] = final_return
+                exit_dates.iloc[pos] = final_exit_date
+                
+            return pd.DataFrame({
+                'Target_Success': labels,
+                'Realized_Return': returns,
+                'Exit_Date': exit_dates
+            }, index=group.index)
+
+        sim_results = determine_pro_swing_success(g)
+        g['Target_Success'] = sim_results['Target_Success']
+        g['Realized_Return'] = sim_results['Realized_Return']
+        g['Exit_Date'] = sim_results['Exit_Date']
         return g
         
     processed_df = df.groupby('Symbol', group_keys=True).apply(calculate_indicators).reset_index(level=0)
     processed_df = processed_df.reset_index(drop=True)
+    
+    # Calculate Market Breadth (Institutional Tide)
+    # % of stocks above their 50-EMA on each date
+    logging.info("Calculating Market Breadth (Institutional Tide)...")
+    breadth = processed_df.groupby('Date')['Above_EMA50'].mean().reset_index()
+    breadth.columns = ['Date', 'Market_Breadth_50EMA']
+    processed_df = pd.merge(processed_df, breadth, on='Date', how='left')
+    
     processed_df.to_parquet(PROCESSED_FILE, index=False)
     return processed_df
 
 def write_label_diagnostics(df):
-    hits = df[df['Screener_Hit'] == True].copy()
+    hits = df[df['First_Hit'] == True].copy()
     if hits.empty:
         diagnostics = {
             'total_screener_hits': 0,
@@ -599,7 +725,8 @@ def model_probabilities(model, X):
 
 def train_model(df):
     logging.info("Training and Evaluating ML Models with Walk-Forward Validation...")
-    train_data = df[df['Screener_Hit'] == True].copy()
+    # Train on high-conviction first hits (technical or stealth)
+    train_data = df[df['First_Hit'] == True].copy()
     
     features = MODEL_FEATURES
     
@@ -631,22 +758,12 @@ def train_model(df):
         return model
 
     # Define models to test
-    # Use Pipelines for models that require scaling
+    # Focused on high-performing tree-based models for institutional edge
     models = {
-        'XGBoost': XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42),
-        'RandomForest': RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42),
-        'NeuralNetwork': Pipeline([
-            ('scaler', StandardScaler()),
-            ('mlp', MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42))
-        ]),
-        'LogisticRegression': Pipeline([
-            ('scaler', StandardScaler()),
-            ('lr', LogisticRegression(max_iter=1000, random_state=42))
-        ]),
-        'SVM': Pipeline([
-            ('scaler', StandardScaler()),
-            ('svc', SVC(probability=True, random_state=42))
-        ])
+        'XGBoost': XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42),
+        'RandomForest': RandomForestClassifier(n_estimators=300, max_depth=12, min_samples_leaf=5, random_state=42),
+        'LightGBM': LGBMClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1),
+        'CatBoost': CatBoostClassifier(iterations=300, learning_rate=0.03, depth=6, subsample=0.8, random_state=42, verbose=False)
     }
     
     # Walk-forward validation by year
@@ -654,6 +771,7 @@ def train_model(df):
     years = sorted(train_data['Year'].unique())
     
     model_fold_metrics = {name: [] for name in models.keys()}
+    oos_preds_list = []
     
     # Need at least 2 years for walk forward
     if len(years) >= 2:
@@ -670,7 +788,10 @@ def train_model(df):
             # Skip if very few test or train samples
             if len(y_tr) < 20 or len(y_te) < 10:
                 continue
-                
+            
+            fold_preds = train_data.loc[test_mask].copy()
+            fold_scores = np.zeros(len(X_te))
+            
             for name, model in models.items():
                 current_step += 1
                 logging.info(f"PROGRESS:{current_step}/{total_steps}")
@@ -680,17 +801,21 @@ def train_model(df):
                     preds = model.predict(X_te)
                     probabilities = model_probabilities(model, X_te)
                     model_fold_metrics[name].append(calculate_classification_metrics(y_te, preds, probabilities))
+                    
+                    # Track scores for ensemble diagnostic
+                    fold_scores += probabilities / len(models)
+                    
                 except Exception as e:
                     logging.warning(f"Model {name} failed on year {test_year}: {e}")
-                    model_fold_metrics[name].append({
-                        'accuracy': 0.0,
-                        'balanced_accuracy': 0.0,
-                        'precision': 0.0,
-                        'recall': 0.0,
-                        'f1': 0.0,
-                        'roc_auc': 0.0,
-                        'average_precision': 0.0,
-                    })
+            
+            fold_preds['OOS_Score'] = fold_scores
+            oos_preds_list.append(fold_preds)
+                    
+        # Save OOS Predictions
+        if oos_preds_list:
+            oos_df = pd.concat(oos_preds_list)
+            oos_df.to_parquet(os.path.join(DATA_DIR, "oos_predictions.parquet"), index=False)
+            logging.info(f"Saved {len(oos_df)} Out-Of-Sample predictions to data/oos_predictions.parquet")
                     
         # Average each out-of-sample metric across walk-forward folds.
         avg_metrics = {}

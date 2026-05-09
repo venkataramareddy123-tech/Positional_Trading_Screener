@@ -19,7 +19,7 @@ export BACKFILL_MISSING_DATES=${BACKFILL_MISSING_DATES:-0}
 export CUDA_VISIBLE_DEVICES=""
 
 echo "Syncing NSE data, corporate actions, features, and models..."
-python pipeline.py
+./.venv/bin/python pipeline.py
 
 echo "Starting Streamlit Dashboard..."
-.venv/bin/streamlit run app.py
+./.venv/bin/streamlit run app.py
