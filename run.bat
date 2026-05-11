@@ -24,7 +24,8 @@ echo Installing required packages (this may take a minute)...
 pip install -r requirements.txt --quiet
 
 :: Set Environment Variables
-set DAYS_TO_FETCH=1250
+:: 2520 = 10 Years (Recommended for Momentum Multibagger Strategy)
+set DAYS_TO_FETCH=2520
 set BACKFILL_MISSING_DATES=0
 set CUDA_VISIBLE_DEVICES=""
 

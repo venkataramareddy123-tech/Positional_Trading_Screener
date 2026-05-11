@@ -11,7 +11,7 @@ This project hunts for institutional activity using two core strategies:
 *   **The Action List:** Explosive breakouts with massive volume surges (>1.5x) and price strength.
 *   **The Stealth Watchlist:** Quiet, "spring-coiled" accumulation where delivery percentages are surging while price remains stable.
 
-The system uses a **Walk-Forward ML Ensemble** (XGBoost, Random Forest, LightGBM, CatBoost) to predict the probability of a stock hitting a **+15% target** within 20 days.
+The system uses a **Walk-Forward ML Ensemble** (XGBoost, Random Forest, LightGBM, CatBoost) to predict the probability of a stock hitting a **+25% target** within 60 days.
 
 ---
 

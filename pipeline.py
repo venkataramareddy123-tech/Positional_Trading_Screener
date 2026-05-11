@@ -50,12 +50,14 @@ MODEL_FILE = os.path.join(DATA_DIR, "xgb_model.pkl")
 LABEL_DIAGNOSTICS_FILE = os.path.join(DATA_DIR, "label_diagnostics.json")
 SELECTION_METRIC = "average_precision"
 MODEL_FEATURES = [
-    'Vol_Surge', 'Del_Surge', 'Close_Location',
-    'RS_1D', 'RS_5D', 'RS_20D', 'ATR_30', 'BB_Width',
+    'Vol_Surge', 'Del_Surge', 'Close_Location', 'Upper_Wick_Ratio',
+    'RS_1D', 'RS_5D', 'RS_20D', 'RS_126D', 'ATR_30', 'BB_Width',
     'Nifty_vs_EMA50', 'Nifty_vs_EMA200', 'Dist_From_52W_High',
     'Smart_Money_Score', 'Is_Inst_Buy', 'Inst_Intensity', 
     'Del_Anomaly', 'Vol_Trend', 'Dist_From_EMA50',
-    'India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D'
+    'India_VIX', 'VIX_Change_5D', 'VIX_Rank_252D',
+    'Market_Breadth_50EMA', 'Trend_Score',
+    'RSI_4', 'Dist_From_20SMA', 'BB_Squeeze_30', 'Price_Momentum_3M'
 ]
 
 def clean_numeric_series(series):
@@ -129,8 +131,10 @@ def fetch_nifty_benchmark_from_nselib(start_date, end_date):
     nifty_parts = []
     vix_parts = []
 
-    while chunk_start <= end_date:
+    while chunk_start < end_date:
         chunk_end = min(chunk_start + timedelta(days=89), end_date)
+        if chunk_start >= chunk_end:
+            break
         from_date = chunk_start.strftime('%d-%m-%Y')
         to_date = chunk_end.strftime('%d-%m-%Y')
 
@@ -218,8 +222,15 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
     elif backfill_missing_dates:
         dates_to_fetch = [d for d in trading_dates if d not in existing_date_set]
     else:
-        dates_to_fetch = [d for d in trading_dates if d > latest_existing_date]
+        # Robust comparison with NaT: if latest_existing_date is NaT, fetch all trading_dates
+        if pd.isna(latest_existing_date):
+            dates_to_fetch = list(trading_dates)
+        else:
+            dates_to_fetch = [d for d in trading_dates if d > latest_existing_date]
 
+    # Reverse order to fetch newest data first (better for UX and robust against interruptions)
+    dates_to_fetch = sorted(dates_to_fetch, reverse=True)
+    
     total_dates = len(dates_to_fetch)
     new_data_fetched = False
     if total_dates == 0:
@@ -227,11 +238,32 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
     
     for i, trading_date in enumerate(dates_to_fetch):
         date_str = trading_date.strftime('%d-%m-%Y')
-        logging.info(f"PROGRESS:{i}/{total_dates}")
-        logging.info(f"Fetching data for {date_str}...")
+        logging.info(f"PROGRESS:{i}/{total_dates} - Fetching {date_str}")
+        
+        # Retry mechanism for robustness during long 10-year fetches
+        max_retries = 3
+        df_day = pd.DataFrame()
+        
+        for attempt in range(max_retries):
+            try:
+                df_day = capital_market.bhav_copy_with_delivery(date_str)
+                if not df_day.empty:
+                    break
+            except Exception as e:
+                message = str(e)
+                if "Data not found" in message or "404" in message:
+                    if attempt == max_retries - 1:
+                        logging.info(f"NSE has no bhavcopy delivery data for {date_str}; skipping.")
+                    break # Don't retry 404s
+                
+                logging.warning(f"Attempt {attempt+1} failed for {date_str}: {message}")
+                if attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1)) # More conservative backoff
+        
+        if df_day.empty:
+            continue
+
         try:
-            df_day = capital_market.bhav_copy_with_delivery(date_str)
-            
             # Standardize column names
             df_day.columns = df_day.columns.str.strip().str.upper()
             
@@ -249,13 +281,14 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
                 'DELIV_PER': 'Delivery_Percent'
             }
             
-            if 'SERIES' in df_day.columns:
-                df_day = df_day[df_day['SERIES'] == 'EQ']
+            df_day = df_day.rename(columns=col_map)
+            
+            if 'Series' in df_day.columns:
+                df_day = df_day[df_day['Series'] == 'EQ']
             
             # Filter ETFs and Commodity-linked securities
             df_day = df_day[~df_day['Symbol'].apply(is_etf_or_commodity)]
             
-            df_day = df_day.rename(columns=col_map)
             df_day['Date'] = pd.to_datetime(date_str, format='%d-%m-%Y')
             
             req_cols = ['Date', 'Symbol', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover', 'Delivery_Volume', 'Delivery_Percent']
@@ -271,21 +304,23 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
             all_data.append(df_day)
             new_data_fetched = True
             
-            # Save incrementally every 50 dates to prevent data loss on interruption
+            # Save incrementally to prevent data loss - Reduced frequency for safety
             if len(all_data) >= 50:
                 df_new = pd.concat(all_data, ignore_index=True)
-                df_existing = pd.concat([df_existing, df_new], ignore_index=True)
+                if os.path.exists(RAW_FILE):
+                    df_existing = pd.read_parquet(RAW_FILE)
+                    df_existing = pd.concat([df_existing, df_new], ignore_index=True)
+                else:
+                    df_existing = df_new
+                    
                 df_existing = df_existing.drop_duplicates(subset=['Date', 'Symbol'])
                 df_existing.to_parquet(RAW_FILE, index=False)
                 all_data = [] # Reset buffer
+                logging.info(f"Saved incremental update to {RAW_FILE}")
                 
-            time.sleep(0.5)
+            time.sleep(1.0) # More conservative to avoid NSE blocking
         except Exception as e:
-            message = str(e)
-            if "Data not found" in message:
-                logging.info(f"NSE has no bhavcopy delivery data for {date_str}; skipping.")
-            else:
-                logging.warning(f"Failed to fetch {date_str}: {e}")
+            logging.error(f"Error processing data for {date_str}: {e}")
             
     if total_dates > 0:
         logging.info(f"PROGRESS:{total_dates}/{total_dates}")
@@ -299,47 +334,64 @@ def fetch_historical_bhavcopies(days_back=1250, nifty_df=None):
     return df_existing
 
 def fetch_nifty_benchmark(days_back=1250):
-    logging.info("Fetching Nifty 50 and India VIX Benchmark Data...")
+    logging.info(f"Fetching Nifty 50 and India VIX Benchmark Data for {days_back} days...")
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back * 1.5)
-
+    start_date = end_date - timedelta(days=int(days_back * 1.5))
+    
+    # Prioritize Yahoo Finance for long historical benchmark data (faster and more reliable for >1 year)
+    nifty = pd.DataFrame()
     try:
-        return fetch_nifty_benchmark_from_nselib(start_date, end_date)
+        logging.info(f"Trying Yahoo Finance for Nifty 50 history...")
+        nifty = yf.download('^NSEI', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+        if not nifty.empty:
+            nifty = nifty.reset_index()
+            if isinstance(nifty.columns, pd.MultiIndex):
+                nifty.columns = [col[0] if col[0] != 'Date' else 'Date' for col in nifty.columns]
+            nifty = nifty.rename(columns={'Close': 'Nifty_Close'})
+            nifty['Date'] = pd.to_datetime(nifty['Date']).dt.tz_localize(None)
+            
+            # If we got significantly less data than requested, fallback to nselib
+            if len(nifty) < days_back * 0.5:
+                logging.warning(f"Yahoo Finance returned only {len(nifty)} rows, which is less than 50% of requested. Trying nselib fallback.")
+                nifty = pd.DataFrame()
     except Exception as e:
-        logging.warning(f"nselib benchmark fetch failed: {e}. Trying Yahoo Finance.")
-    
-    nifty = yf.download('^NSEI', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
-    nifty = nifty.reset_index()
-    
+        logging.warning(f"Yahoo Finance Nifty fetch failed: {e}. Trying nselib.")
+
     if nifty.empty:
-        logging.warning("Failed to fetch Nifty data from Yahoo Finance.")
+        try:
+            nifty = fetch_nifty_benchmark_from_nselib(start_date, end_date)
+        except Exception as e:
+            logging.error(f"nselib benchmark fetch failed: {e}")
+            return load_cached_nifty_benchmark()
+
+    if nifty.empty:
         return load_cached_nifty_benchmark()
-        
-    if isinstance(nifty.columns, pd.MultiIndex):
-        nifty.columns = [col[0] if col[0] != 'Date' else 'Date' for col in nifty.columns]
-        
-    nifty = nifty.rename(columns={'Close': 'Nifty_Close'})
-    nifty['Date'] = pd.to_datetime(nifty['Date']).dt.tz_localize(None)
-    
+
+    nifty = nifty.sort_values('Date').drop_duplicates(subset=['Date'], keep='last')
     nifty['Nifty_EMA50'] = nifty['Nifty_Close'].ewm(span=50, adjust=False).mean()
     nifty['Nifty_EMA200'] = nifty['Nifty_Close'].ewm(span=200, adjust=False).mean()
     
-    vix = yf.download('^INDIAVIX', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
-    vix = vix.reset_index()
-    if not vix.empty:
-        if isinstance(vix.columns, pd.MultiIndex):
-            vix.columns = [col[0] if col[0] != 'Date' else 'Date' for col in vix.columns]
-        vix = vix.rename(columns={'Close': 'India_VIX'})
-        vix['Date'] = pd.to_datetime(vix['Date']).dt.tz_localize(None)
-        nifty = pd.merge(nifty, vix[['Date', 'India_VIX']], on='Date', how='left')
-    else:
-        nifty['India_VIX'] = np.nan
+    # Fetch VIX from Yahoo Finance (usually more reliable than nselib)
+    if 'India_VIX' not in nifty.columns or nifty['India_VIX'].isna().all():
+        try:
+            vix = yf.download('^INDIAVIX', start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+            if not vix.empty:
+                vix = vix.reset_index()
+                if isinstance(vix.columns, pd.MultiIndex):
+                    vix.columns = [col[0] if col[0] != 'Date' else 'Date' for col in vix.columns]
+                vix = vix.rename(columns={'Close': 'India_VIX'})
+                vix['Date'] = pd.to_datetime(vix['Date']).dt.tz_localize(None)
+                nifty = pd.merge(nifty, vix[['Date', 'India_VIX']], on='Date', how='left')
+        except Exception as e:
+            logging.warning(f"Yahoo Finance VIX fetch failed: {e}")
 
-    nifty = nifty.sort_values('Date')
+    if 'India_VIX' not in nifty.columns:
+        nifty['India_VIX'] = np.nan
+        
     nifty['India_VIX'] = nifty['India_VIX'].ffill().bfill()
     nifty = nifty[['Date', 'Nifty_Close', 'Nifty_EMA50', 'Nifty_EMA200', 'India_VIX']]
     nifty.to_parquet(NIFTY_FILE, index=False)
-    logging.info("Fetched Nifty 50 and India VIX benchmark data from Yahoo Finance.")
+    logging.info(f"Final benchmark data: {len(nifty)} sessions.")
     return nifty
 
 def normalize_corporate_actions_columns(actions):
@@ -383,8 +435,10 @@ def fetch_corporate_actions(days_back=1250):
     chunk_start = start_date
     parts = []
 
-    while chunk_start <= end_date:
+    while chunk_start < end_date:
         chunk_end = min(chunk_start + timedelta(days=364), end_date)
+        if chunk_start >= chunk_end:
+            break
         from_date = chunk_start.strftime('%d-%m-%Y')
         to_date = chunk_end.strftime('%d-%m-%Y')
         try:
@@ -502,9 +556,10 @@ def engineer_features(df, nifty_df):
             
         g['Daily_Range'] = g['High'] - g['Low']
         g['Close_Location'] = (g['Close'] - g['Low']) / (g['Daily_Range'] + 1e-8)
+        g['Upper_Wick_Ratio'] = (g['High'] - g.loc[:, ['Open', 'Close']].max(axis=1)) / (g['Daily_Range'] + 1e-8)
         g['Top_10_Percent'] = g['Close_Location'] >= 0.90
         
-        # --- CORE INDICATORS (Needed for filters and R:R) ---
+        # --- CORE TREND & BASE INDICATORS ---
         try:
             g['ATR_30'] = ta.volatility.average_true_range(g['High'], g['Low'], g['Close'], window=30, fillna=True)
             indicator_bb = ta.volatility.BollingerBands(close=g['Close'], window=30, window_dev=2, fillna=True)
@@ -512,36 +567,77 @@ def engineer_features(df, nifty_df):
         except:
             g['ATR_30'] = np.nan
             g['BB_Width'] = np.nan
-            
+
         g['EMA_50'] = g['Close'].ewm(span=50, adjust=False).mean()
+        g['EMA_150'] = g['Close'].ewm(span=150, adjust=False).mean()
         g['EMA_200'] = g['Close'].ewm(span=200, adjust=False).mean()
+        g['SMA_20'] = g['Close'].rolling(window=20).mean()
+        g['SMA_50'] = g['Close'].rolling(window=50).mean()
+        g['SMA_150'] = g['Close'].rolling(window=150).mean()
+        g['SMA_200'] = g['Close'].rolling(window=200).mean()
+        
         g['Above_EMA50'] = (g['Close'] > g['EMA_50']).astype(int)
         g['Institutional_Trend'] = (g['Close'] > g['EMA_200']) & (g['EMA_50'] > g['EMA_200'])
         
+        g['High_52W'] = g['High'].rolling(252, min_periods=20).max()
+        g['Low_52W'] = g['Low'].rolling(252, min_periods=20).min()
+        g['Dist_From_52W_High'] = g['Close'] / (g['High_52W'] + 1e-8) - 1
+        g['Dist_From_52W_Low'] = g['Close'] / (g['Low_52W'] + 1e-8) - 1
+
+        # --- MARK MINERVINI TREND TEMPLATE (Stage 2) ---
+        g['SMA_200_1M_Ago'] = g['SMA_200'].shift(20)
+        g['Minervini_Trend'] = (
+            (g['Close'] > g['SMA_150']) & 
+            (g['Close'] > g['SMA_200']) &
+            (g['SMA_150'] > g['SMA_200']) &
+            (g['SMA_200'] > g['SMA_200_1M_Ago']) &
+            (g['SMA_50'] > g['SMA_150']) &
+            (g['Close'] > g['SMA_50']) &
+            (g['Dist_From_52W_Low'] > 0.30) &
+            (g['Dist_From_52W_High'] > -0.25)
+        )
+
+        # --- VOLATILITY CONTRACTION PATTERN (VCP) ---
+        # Look for price tightening (ATR decreasing) and volume drying up
+        g['ATR_Trend'] = g['ATR_30'] / (g['ATR_30'].rolling(20).mean() + 1e-8)
+        g['VCP_Squeeze'] = (g['ATR_Trend'] < 0.8) & (g['Volume'] < g['Vol_30D_SMA'] * 0.8)
+
+        # --- SWING/POSITIONAL DUAL-ENGINE INDICATORS ---
+        try:
+            g['RSI_4'] = ta.momentum.rsi(g['Close'], window=4, fillna=True)
+            g['Dist_From_20SMA'] = (g['Close'] / (g['SMA_20'] + 1e-8)) - 1
+            g['BB_Squeeze_30'] = g['BB_Width'].rolling(30).min() / (g['BB_Width'] + 1e-8)
+            g['Price_Momentum_3M'] = g['Close'].pct_change(60)
+        except:
+            g['RSI_4'] = 50.0
+            g['Dist_From_20SMA'] = 0.0
+            g['BB_Squeeze_30'] = 1.0
+            g['Price_Momentum_3M'] = 0.0
+
         # --- SMART MONEY ACCUMULATION SCORE (0-100) ---
         g['Del_Pct'] = g['Delivery_Volume'] / (g['Volume'] + 1e-8)
         g['Del_Pct_5D'] = g['Del_Pct'].rolling(5).mean()
         g['Del_Pct_50D'] = g['Del_Pct'].rolling(50, min_periods=10).mean()
         g['Del_Anomaly'] = g['Del_Pct_5D'] / (g['Del_Pct_50D'] + 1e-8)
-        
+
         up_vol = np.where(g['Close'] > g['Close'].shift(1), g['Volume'], 0)
         down_vol = np.where(g['Close'] < g['Close'].shift(1), g['Volume'], 0)
         g['Up_Vol_15D'] = pd.Series(up_vol, index=g.index).rolling(15, min_periods=5).sum()
         g['Down_Vol_15D'] = pd.Series(down_vol, index=g.index).rolling(15, min_periods=5).sum()
         g['Vol_Trend'] = g['Up_Vol_15D'] / (g['Down_Vol_15D'] + 1e-8)
-        
+
         if 'BB_Width' in g.columns:
             g['BB_Squeeze_Rank'] = g['BB_Width'].rolling(120, min_periods=30).rank(pct=True)
             g['Squeeze_Score'] = 1.0 - g['BB_Squeeze_Rank']
         else:
             g['Squeeze_Score'] = 0.0
-            
+
         score_del = np.clip((g['Del_Anomaly'] - 1.0) / 1.5, 0, 1) * 30
         score_vol = np.clip((g['Vol_Trend'] - 1.0) / 2.0, 0, 1) * 30
         score_sqz = g['Squeeze_Score'].fillna(0) * 30
         score_ema = g['Above_EMA50'] * 10
         g['Smart_Money_Score'] = (score_del + score_vol + score_sqz + score_ema).round(2)
-        
+
         # --- SCREENER HITS (The "Action" and "Stealth" Signals) ---
         g['Screener_Hit'] = (
             ((g['Vol_Surge'] > 1.5) | (g['Del_Surge'] > 1.5)) & 
@@ -550,17 +646,39 @@ def engineer_features(df, nifty_df):
             (g['Close'] > g['EMA_200']) &
             (g['Smart_Money_Score'] >= 60)
         )
-        
+
         g['Smart_Money_Hit'] = (g['Smart_Money_Score'] >= 75) & (g['Screener_Hit'] == False) & (g['Close'] > g['EMA_200'])
-        g['Signal'] = g['Screener_Hit'] | g['Smart_Money_Hit']
-        g['First_Hit'] = g['Signal'] & (g['Signal'].rolling(window=6).sum() <= 1)
-        
+
         # --- RELATIVE STRENGTH & BENCHMARK ---
         for window in [1, 5, 20, 126]:
             stock_ret = g['Close'].pct_change(window)
             nifty_ret = g['Nifty_Close'].pct_change(window)
             g[f'RS_{window}D'] = stock_ret - nifty_ret
-            
+
+        # Composite Trend Score: Combines RS and EMA slopes
+        rs_20 = g['RS_20D'].fillna(0)
+        rs_126 = g['RS_126D'].fillna(0)
+        ema_alignment = g['Institutional_Trend'].astype(float)
+        g['Trend_Score'] = (rs_20 * 0.4 + rs_126 * 0.3 + ema_alignment * 0.3).round(4)
+
+        # --- MARKET REGIME FILTERS (The Master Switch) ---
+        g['Nifty_Uptrend'] = (g['Nifty_Close'] > g['Nifty_EMA50']) & (g['Nifty_EMA50'] > g['Nifty_EMA200'])
+        g['Nifty_Bear'] = (g['Nifty_Close'] < g['Nifty_EMA200'])
+
+        # --- ALPHA ENGINE SIGNAL GENERATORS ---
+
+        # 1. All-Weather Multibagger Candidate Pool: Broadening the search to let ML find the leaders
+        g['Breakout_Signal'] = (
+            (g['Close'] > g['EMA_150']) & (g['EMA_150'] > g['EMA_200']) & # Primary Uptrend Base
+            (g['Smart_Money_Score'] > 45) & # Basic institutional footprint
+            (g['Dist_From_52W_High'] > -0.25) & # Within broad basing range
+            (g['RS_20D'] > -0.05) # Not in a freefall
+        )
+
+        g['Signal'] = g['Breakout_Signal']
+        # Strict first hit for Multibagger entry: no other signals in the last 20 days
+        g['First_Hit'] = g['Signal'] & (g['Signal'].rolling(window=20).sum() <= 1)
+
         g['Dist_From_EMA50'] = g['Close'] / (g['EMA_50'] + 1e-8) - 1
         g['Is_Inst_Buy'] = ((g['Close'] > g['EMA_200']) & (g['Smart_Money_Score'] >= 65)).astype(int)
         g['Inst_Intensity'] = (g['Vol_Surge'] + g['Del_Surge']) / 2.0
@@ -569,102 +687,99 @@ def engineer_features(df, nifty_df):
         g['Nifty_vs_EMA200'] = g['Nifty_Close'] / (g['Nifty_EMA200'] + 1e-8) - 1
         g['VIX_Change_5D'] = g['India_VIX'].pct_change(5)
         g['VIX_Rank_252D'] = g['India_VIX'].rolling(252, min_periods=20).rank(pct=True)
-        g['High_52W'] = g['High'].rolling(252, min_periods=20).max()
-        g['Dist_From_52W_High'] = g['Close'] / (g['High_52W'] + 1e-8) - 1
-        
+
         # --- BACKTESTING / LABELING ---
         g['Entry_Price'] = g['Open'].shift(-1)
         
         # Keep key forward windows for diagnostics/forensics
-        for i in [10, 20, 30]:
+        for i in [10, 20, 30, 60]:
             fut_high = g['High'].shift(-1)[::-1].rolling(i, min_periods=1).max()[::-1]
             fut_low = g['Low'].shift(-1)[::-1].rolling(i, min_periods=1).min()[::-1]
             g[f'Max_Return_{i}D'] = fut_high / (g['Entry_Price'] + 1e-8) - 1
             g[f'Max_Drawdown_{i}D'] = fut_low / (g['Entry_Price'] + 1e-8) - 1
             
         def determine_pro_swing_success(group):
-            """
-            Original labeling logic: Fixed +15% Target vs 2.0x ATR Stop Loss.
-            Optimized with numpy for fast processing.
-            """
             labels = np.full(len(group), np.nan)
             returns = np.full(len(group), np.nan)
             exit_dates = pd.Series([pd.NaT] * len(group), index=group.index)
-            
             hit_indices = np.where(group['First_Hit'] == True)[0]
             if len(hit_indices) == 0:
                 return pd.DataFrame({'Target_Success': labels, 'Realized_Return': returns, 'Exit_Date': exit_dates}, index=group.index)
-                
+            
             opens = group['Open'].values
-            highs = group['High'].values
             lows = group['Low'].values
+            highs = group['High'].values
             closes = group['Close'].values
-            atrs = group['ATR_30'].values
+            ema50s = group['EMA_50'].values
             dates = group['Date'].values
             n = len(group)
             
             for pos in hit_indices:
                 if pos + 1 >= n: continue
-                
                 entry_price = opens[pos + 1]
-                atr_at_entry = atrs[pos]
-                if pd.isna(entry_price) or pd.isna(atr_at_entry): continue
+                if pd.isna(entry_price): continue
                 
-                # Original Fixed Rules
-                stop_dist = 2.0 * atr_at_entry
-                actual_stop_pct = max(0.03, min(0.10, stop_dist / (entry_price + 1e-8)))
-                stop_price = entry_price * (1 - actual_stop_pct)
-                target_price = entry_price * 1.15
+                max_ret = 0
+                final_return = 0
+                final_exit_date = dates[-1]
                 
-                final_label = 0
-                final_return = -actual_stop_pct
-                final_exit_date = dates[min(pos + 20, n - 1)]
+                # Risk Management: Hard Stop at -8%
+                hard_stop = entry_price * 0.92
                 
-                for d in range(1, 21):
+                # Multibagger Exit: Close below 50-day EMA
+                for d in range(1, n - pos):
                     curr_idx = pos + d
-                    if curr_idx >= n: break
+                    curr_close = closes[curr_idx]
+                    curr_low = lows[curr_idx]
+                    curr_high = highs[curr_idx]
+                    curr_ema50 = ema50s[curr_idx]
                     
-                    if highs[curr_idx] >= target_price:
-                        final_label = 1
-                        final_return = 0.15
+                    # Update peak return achieved
+                    peak_ret = (curr_high / entry_price) - 1
+                    max_ret = max(max_ret, peak_ret)
+                    
+                    # Check for exit conditions
+                    # 1. Hard stop hit intra-day
+                    if curr_low <= hard_stop:
+                        final_return = (hard_stop / entry_price) - 1
                         final_exit_date = dates[curr_idx]
                         break
                     
-                    if lows[curr_idx] <= stop_price:
-                        final_label = 0
-                        final_return = -actual_stop_pct
+                    # 2. Closing below 50-day EMA (Trend Violation)
+                    if curr_close < curr_ema50:
+                        final_return = (curr_close / entry_price) - 1
                         final_exit_date = dates[curr_idx]
                         break
                         
-                    if d == 20:
-                        final_return = (closes[curr_idx] / entry_price) - 1
-                        final_label = 1 if final_return >= 0.05 else 0
+                    # Final day of data
+                    if d == (n - pos - 1):
+                        final_return = (curr_close / entry_price) - 1
                         final_exit_date = dates[curr_idx]
                 
-                labels[pos] = final_label
+                # Label as 1 (Multibagger Start) if price gained > 25% before exit
+                labels[pos] = 1 if max_ret >= 0.25 else 0
                 returns[pos] = final_return
                 exit_dates.iloc[pos] = final_exit_date
                 
-            return pd.DataFrame({
-                'Target_Success': labels,
-                'Realized_Return': returns,
-                'Exit_Date': exit_dates
-            }, index=group.index)
+            return pd.DataFrame({'Target_Success': labels, 'Realized_Return': returns, 'Exit_Date': exit_dates}, index=group.index)
 
         sim_results = determine_pro_swing_success(g)
         g['Target_Success'] = sim_results['Target_Success']
         g['Realized_Return'] = sim_results['Realized_Return']
         g['Exit_Date'] = sim_results['Exit_Date']
         return g
-        
+
     processed_df = df.groupby('Symbol', group_keys=True).apply(calculate_indicators).reset_index(level=0)
     processed_df = processed_df.reset_index(drop=True)
-    
-    # Calculate Market Breadth (Institutional Tide)
+
+
+        # Calculate Market Breadth (Institutional Tide)
     # % of stocks above their 50-EMA on each date
     logging.info("Calculating Market Breadth (Institutional Tide)...")
     breadth = processed_df.groupby('Date')['Above_EMA50'].mean().reset_index()
     breadth.columns = ['Date', 'Market_Breadth_50EMA']
+    # Shift breadth by 1 day to prevent look-ahead bias (Leakage Fix)
+    breadth['Market_Breadth_50EMA'] = breadth['Market_Breadth_50EMA'].shift(1)
     processed_df = pd.merge(processed_df, breadth, on='Date', how='left')
     
     processed_df.to_parquet(PROCESSED_FILE, index=False)
@@ -693,7 +808,7 @@ def write_label_diagnostics(df):
             'positive_label_rate': float(usable['Target_Success'].mean()) if len(usable) else 0.0,
             'suspicious_return_rate_gt_100pct': float((usable['Max_Return_10D'] > 1.0).mean()) if len(usable) else 0.0,
             'suspicious_drawdown_rate_lt_minus_50pct': float((usable['Max_Drawdown_10D'] < -0.5).mean()) if len(usable) else 0.0,
-            'label_definition': 'Buy next trading day open after Screener_Hit; positive if Max_Return_10D exceeds 5%. Incomplete future labels are excluded from training.',
+            'label_definition': 'Multibagger Engine: Success if +25% peak gain reached before trailing 50-EMA stop.',
         }
     with open(LABEL_DIAGNOSTICS_FILE, "w") as f:
         json.dump(diagnostics, f, indent=2)
@@ -734,7 +849,8 @@ def train_model(df):
     train_data = train_data.dropna(subset=features + ['Target_Success'])
     
     max_date = train_data['Date'].max()
-    train_data = train_data[train_data['Date'] <= (max_date - pd.Timedelta(days=15))]
+    # 6-Month Blind Validation Cutoff (126 trading days) to ensure true out-of-sample testing
+    train_data = train_data[train_data['Date'] <= (max_date - pd.Timedelta(days=126))]
     train_data = train_data.sort_values('Date')
     
     if len(train_data) < 50:
@@ -757,13 +873,19 @@ def train_model(df):
             pickle.dump(model, f)
         return model
 
+    # Calculate scale_pos_weight for imbalanced momentum classes
+    num_neg = (train_data['Target_Success'] == 0).sum()
+    num_pos = (train_data['Target_Success'] == 1).sum()
+    pos_weight = num_neg / (num_pos + 1e-8)
+    logging.info(f"Class Imbalance: Neg={num_neg}, Pos={num_pos}, Scale_Pos_Weight={pos_weight:.2f}")
+
     # Define models to test
     # Focused on high-performing tree-based models for institutional edge
     models = {
-        'XGBoost': XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42),
+        'XGBoost': XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, scale_pos_weight=pos_weight, random_state=42),
         'RandomForest': RandomForestClassifier(n_estimators=300, max_depth=12, min_samples_leaf=5, random_state=42),
-        'LightGBM': LGBMClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1),
-        'CatBoost': CatBoostClassifier(iterations=300, learning_rate=0.03, depth=6, subsample=0.8, random_state=42, verbose=False)
+        'LightGBM': LGBMClassifier(n_estimators=300, learning_rate=0.03, max_depth=6, subsample=0.8, colsample_bytree=0.8, scale_pos_weight=pos_weight, random_state=42, verbose=-1),
+        'CatBoost': CatBoostClassifier(iterations=300, learning_rate=0.03, depth=6, subsample=0.8, auto_class_weights='Balanced', random_state=42, verbose=False)
     }
     
     # Walk-forward validation by year
@@ -911,8 +1033,9 @@ def train_model(df):
 def main():
     logging.info("Starting Institutional Volume Screener Pipeline")
     
-    DAYS_TO_FETCH = int(os.environ.get('DAYS_TO_FETCH', 1250))
-    logging.info(f"Configured to fetch {DAYS_TO_FETCH} trading days.")
+    # 10 years (approx 2520 trading days) for robust quant patterns
+    DAYS_TO_FETCH = int(os.environ.get('DAYS_TO_FETCH', 2520))
+    logging.info(f"Configured to fetch {DAYS_TO_FETCH} trading days for Swing/Positional analysis.")
     
     nifty_df = fetch_nifty_benchmark(days_back=DAYS_TO_FETCH)
     corporate_actions = fetch_corporate_actions(days_back=DAYS_TO_FETCH)

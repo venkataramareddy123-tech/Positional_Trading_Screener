@@ -51,20 +51,20 @@ It triggers when a stock meets these high-conviction "Smart Money" thresholds:
 ---
 
 ## 🤖 4. The Machine Learning Framework
-The AI doesn't just "guess"; it evaluates patterns against 5 years of historical outcomes using a rigorous **Walk-Forward validation** process.
+The AI doesn't just "guess"; it evaluates patterns against 10 years of historical outcomes using a rigorous **Walk-Forward validation** process.
 
-*   **The Goal:** Predict if a stock will hit a **+15% target** within 20 trading days.
+*   **The Goal:** Predict if a stock will hit a **+25% target** within 60 trading days.
 *   **Realistic Entry:** All metrics are calculated from the **Next Day's Open price** (T+1), ensuring the AI accounts for overnight gaps.
 *   **The Models:** The system runs a "tournament" between **XGBoost, RandomForest, LightGBM, and CatBoost**.
 *   **The Ensemble:** The platform automatically selects the **top 2 algorithms** based on their Out-of-Sample "Average Precision" and creates a weighted ensemble.
-*   **Risk-Adjusted Logic:** The system uses a **2.5:1 Reward-to-Risk ratio** (targeting 15% gains vs. a ~6% ATR-based stop loss).
+*   **Risk-Adjusted Logic:** The system uses a **~3:1 Reward-to-Risk ratio** (targeting 25% gains vs. a ~9% ATR-based stop loss).
 
 ---
 
 ## 🛡️ 5. Risk Management System
 Unlike simple screeners, this platform includes a professional-grade Risk Manager:
-1.  **ATR-Based Stops:** Stop losses are dynamically set at **2.0x the Average True Range (ATR)**, ensuring the stock has enough "room to breathe" based on its own volatility.
-2.  **Hard Survival Rules:** Stop losses are capped between **3% and 10%** to prevent catastrophic losses on volatile stocks.
+1.  **ATR-Based Stops:** Stop losses are dynamically set at **3.0x the Average True Range (ATR)**, ensuring the stock has enough "room to breathe" based on its own volatility.
+2.  **Hard Survival Rules:** Stop losses are capped between **3% and 15%** to prevent catastrophic losses on volatile stocks.
 3.  **Position Sizing:** The dashboard automatically calculates exactly how many shares to buy based on your **Total Capital** and a **1% Risk-per-Trade** rule.
 
 ### 1. Prerequisites
@@ -84,7 +84,7 @@ chmod +x run.sh
 These scripts will:
 *   Create a virtual environment (`.venv`).
 *   Install all necessary libraries.
-*   Download historical data (Note: The first run takes **1-2 hours** to fetch 5 years of NSE data).
+*   Download historical data (Note: The first run takes **1-2 hours** to fetch 10 years of NSE data).
 *   Train the AI models.
 *   Open the Dashboard in your browser.
 

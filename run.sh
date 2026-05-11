@@ -12,9 +12,10 @@ source .venv/bin/activate
 echo "Installing required packages..."
 pip install -r requirements.txt
 
-# You can change DAYS_TO_FETCH to 1250 for a full 5-year run.
-# The default is 1250, but it will take a while to download.
-export DAYS_TO_FETCH=1250
+# You can change DAYS_TO_FETCH for different historical lookbacks.
+# 2520 = 10 Years (Recommended for Momentum Multibagger Strategy)
+# 1250 = 5 Years
+export DAYS_TO_FETCH=2520
 export BACKFILL_MISSING_DATES=${BACKFILL_MISSING_DATES:-0}
 export CUDA_VISIBLE_DEVICES=""
 
